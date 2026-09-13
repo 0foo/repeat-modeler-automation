@@ -44,6 +44,11 @@
 # genome's scratch directory, and exits. Interrupted genomes are simply picked
 # up again next time you start.
 #
+# Only the interrupted STAGE is repeated, not the whole genome. A worker
+# stopped during RepeatMasker on a genome that already modelled successfully
+# keeps that genome's done/ marker and its library, so the retry re-runs
+# RepeatMasker alone -- see "STAGES" in worker.sh.
+#
 # Never use kill -9 here. A hard kill leaves claims and containers orphaned.
 # They are recoverable -- the next worker startup reaps them -- but you lose
 # the graceful container shutdown and it makes `status` misleading until then.
@@ -92,7 +97,8 @@ CONFIG_FILE="$HERE/rmodeler.conf"
 # both. Anything else in the file is a typo, and treated as one.
 CONFIG_KEYS=(IN_DIR WORK_DIR OUT_DIR STATE_DIR LOG_DIR RUN_DIR
              RM_IMAGE DOCKER THREADS MEM_LIMIT GLOB
-             LTRSTRUCT KEEP_WORK RETRY_FAILED STOP_GRACE WORKERS)
+             LTRSTRUCT KEEP_WORK RETRY_FAILED STOP_GRACE WORKERS
+             RUN_MASKER KEEP_MASKED_FASTA)
 
 die() { printf 'config error: %s\n' "$*" >&2; exit 2; }
 
@@ -155,7 +161,7 @@ validate_config() {
     for k in THREADS WORKERS; do
         [[ ${!k} =~ ^[1-9][0-9]*$ ]] || die "$k must be a positive integer (got '${!k}')"
     done
-    for k in LTRSTRUCT KEEP_WORK RETRY_FAILED; do
+    for k in LTRSTRUCT KEEP_WORK RETRY_FAILED RUN_MASKER KEEP_MASKED_FASTA; do
         [[ ${!k} == 0 || ${!k} == 1 ]] || die "$k must be 0 or 1 (got '${!k}')"
     done
     [[ $STOP_GRACE =~ ^[0-9]+$ ]] || die "STOP_GRACE must be a whole number of seconds (got '$STOP_GRACE')"
@@ -270,10 +276,16 @@ status() {
     # queued is the TOTAL input count, not the remaining count. Remaining is
     # queued - done - failed - running. Uses $GLOB, same as worker.sh, so this
     # count matches what workers actually process even if GLOB is customized.
-    echo "queued : $(find "$IN_DIR" -maxdepth 1 -name "$GLOB" | wc -l)"
-    echo "running: $(find "$STATE_DIR/claimed" -maxdepth 1 -mindepth 1 -type d | wc -l)"
-    echo "done   : $(find "$STATE_DIR/done"    -maxdepth 1 -type f | wc -l)"
-    echo "failed : $(find "$STATE_DIR/failed"  -maxdepth 1 -type f | wc -l)"
+    #
+    # "modelled" and "masked" are separate stages, not a total: with
+    # RUN_MASKER=1 a genome is only finished once it appears in both. masked
+    # is shown either way, because markers left over from an earlier
+    # RUN_MASKER=1 run do not disappear when the setting is turned off.
+    echo "queued  : $(find "$IN_DIR" -maxdepth 1 -name "$GLOB" | wc -l)"
+    echo "running : $(find "$STATE_DIR/claimed" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)"
+    echo "modelled: $(find "$STATE_DIR/done"    -maxdepth 1 -type f 2>/dev/null | wc -l)"
+    echo "masked  : $(find "$STATE_DIR/masked"  -maxdepth 1 -type f 2>/dev/null | wc -l)$( (( RUN_MASKER )) || echo '   (RUN_MASKER=0, stage disabled)' )"
+    echo "failed  : $(find "$STATE_DIR/failed"  -maxdepth 1 -type f 2>/dev/null | wc -l)"
     echo
 
     # Live containers, matched by the label worker.sh stamps on them so

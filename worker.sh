@@ -2,9 +2,9 @@
 #==============================================================================
 # worker.sh
 #
-# One RepeatModeler worker. It walks a directory of gzipped genome FASTAs,
-# claims one genome at a time, and runs BuildDatabase + RepeatModeler on it
-# inside the Dfam TE Tools container.
+# One genome worker. It walks a directory of gzipped genome FASTAs, claims one
+# genome at a time, and runs BuildDatabase + RepeatModeler -- then, if
+# RUN_MASKER=1, RepeatMasker -- inside the Dfam TE Tools container.
 #
 # Run as many copies as you have cores for. There is no coordinator process,
 # no queue server, and no shared state file -- see "CONCURRENCY" below.
@@ -52,12 +52,13 @@
 # to disagree about and nothing to keep in sync:
 #
 #   claimed/<sample>/owner   in progress; owner file records host + pid
-#   done/<sample>            finished OK, families files are in $OUT_DIR
-#   failed/<sample>          failed; scratch dir and log kept for inspection
+#   done/<sample>            RepeatModeler finished OK, library is in $OUT_DIR
+#   masked/<sample>          RepeatMasker finished OK, .out is in $OUT_DIR
+#   failed/<sample>          failed; scratch dir and logs kept for inspection
 #
-# A genome named in none of the three is available. That fourth state is not
-# recorded anywhere -- it is the absence of the other three, recomputed from
-# $IN_DIR on every pass.
+# A genome is available when it still has an unfinished stage and is neither
+# claimed nor failed. That state is not recorded anywhere -- it is inferred
+# from the absence of the markers above, recomputed from $IN_DIR every pass.
 #
 # Mutual exclusion is a single mkdir. On a local filesystem mkdir is atomic:
 # the kernel does the does-it-exist check and the create as one indivisible
@@ -86,14 +87,38 @@
 # 4823 here tells you nothing about pid 4823 on another machine.
 #
 #------------------------------------------------------------------------------
+# STAGES
+#
+# A genome goes through two stages, and each records its own marker the moment
+# it succeeds:
+#
+#   model   BuildDatabase + RepeatModeler  -> $OUT_DIR/<sample>-families.fa
+#                                           -> done/<sample>
+#   mask    RepeatMasker -lib <families>   -> $OUT_DIR/<sample>.rm.out
+#           (only when RUN_MASKER=1)          -> masked/<sample>
+#
+# Splitting the markers is what makes the pair restartable. A genome that
+# models and then fails to mask keeps its library and its done/ marker, so the
+# next pass re-runs only RepeatMasker -- it does not throw away a day of
+# RepeatModeler. The same applies to turning masking on after the fact: set
+# RUN_MASKER=1 and every already-modelled genome becomes available again for
+# the mask stage alone.
+#
+# The mask stage needs the library. If stage one just ran it is already in the
+# job directory; otherwise it is copied back from $OUT_DIR, which is the only
+# place it survives, since the job directory is deleted on success.
+#
+#------------------------------------------------------------------------------
 # OPERATING IT BY HAND
 #
 # State is just files, so use the tools you already have:
 #
-#   ls state/done | wc -l                 # progress
+#   ls state/done | wc -l                 # genomes modelled
+#   ls state/masked | wc -l               # genomes masked
 #   ls -l state/claimed/                  # what is running, and since when
 #   ls state/failed                       # what blew up
-#   rm state/done/GCA_002110              # redo one genome
+#   rm state/done/GCA_002110              # redo one genome from scratch
+#   rm state/masked/GCA_002110            # redo just its RepeatMasker run
 #   rm state/failed/*                     # retry all failures on the next pass
 #
 # Do NOT delete anything from claimed/ while workers are running. That makes a
@@ -171,7 +196,8 @@ CONFIG_FILE="$HERE/rmodeler.conf"
 # both. Anything else in the file is a typo, and treated as one.
 CONFIG_KEYS=(IN_DIR WORK_DIR OUT_DIR STATE_DIR LOG_DIR RUN_DIR
              RM_IMAGE DOCKER THREADS MEM_LIMIT GLOB
-             LTRSTRUCT KEEP_WORK RETRY_FAILED STOP_GRACE WORKERS)
+             LTRSTRUCT KEEP_WORK RETRY_FAILED STOP_GRACE WORKERS
+             RUN_MASKER KEEP_MASKED_FASTA)
 
 die() { printf 'config error: %s\n' "$*" >&2; exit 2; }
 
@@ -234,7 +260,7 @@ validate_config() {
     for k in THREADS WORKERS; do
         [[ ${!k} =~ ^[1-9][0-9]*$ ]] || die "$k must be a positive integer (got '${!k}')"
     done
-    for k in LTRSTRUCT KEEP_WORK RETRY_FAILED; do
+    for k in LTRSTRUCT KEEP_WORK RETRY_FAILED RUN_MASKER KEEP_MASKED_FASTA; do
         [[ ${!k} == 0 || ${!k} == 1 ]] || die "$k must be 0 or 1 (got '${!k}')"
     done
     [[ $STOP_GRACE =~ ^[0-9]+$ ]] || die "STOP_GRACE must be a whole number of seconds (got '$STOP_GRACE')"
@@ -254,7 +280,7 @@ WORKER_ID="$(hostname -s)-$$"
 # arguments before mkdir ever runs. -p makes this idempotent, so every worker
 # can do it at startup without caring who got there first.
 mkdir -p "$WORK_DIR" "$OUT_DIR" "$LOG_DIR" \
-         "$STATE_DIR"/{claimed,done,failed} || exit 1
+         "$STATE_DIR"/{claimed,done,failed,masked} || exit 1
 
 #===================================================================== logging
 # Worker chatter goes to stderr, timestamped and tagged with WORKER_ID, so
@@ -430,10 +456,10 @@ detect_thread_flag() {
 # The owner file is written after winning, and exists only so a later worker
 # can tell a live claim from one abandoned by a killed process.
 #
-# "container=" records the BASE name (safe_name(sample)) -- run_pipeline
-# always launches containers as "<base>-db" / "<base>-rm", never the bare
-# base name itself. reap_stale_claims() below must add those same suffixes
-# when it goes looking for an orphan to remove.
+# "container=" records the BASE name (safe_name(sample)) -- the stages always
+# launch containers as "<base>-db" / "<base>-rm" / "<base>-mask", never the
+# bare base name itself. reap_stale_claims() below must add those same
+# suffixes when it goes looking for an orphan to remove.
 claim() {           # $1 = sample -> 0 if we got it
     mkdir "$STATE_DIR/claimed/$1" 2>/dev/null || return 1
     printf 'host=%s\npid=%s\nworker=%s\ncontainer=%s\nstart=%s\n' \
@@ -476,33 +502,25 @@ reap_stale_claims() {
         [[ $host == "$(hostname -s)" ]] || continue
         if ! kill -0 "$pid" 2>/dev/null; then
             log "reaping stale claim: $sample (dead pid $pid)"
-            # The live container is named "<cname>-db" or "<cname>-rm", never
-            # bare $cname -- try both suffixes; whichever doesn't exist just
-            # errors harmlessly under the redirect.
-            [[ -n $cname ]] && $DOCKER rm -f "${cname}-db" "${cname}-rm" >/dev/null 2>&1
+            # The live container is named "<cname>-db", "<cname>-rm" or
+            # "<cname>-mask", never bare $cname -- try every suffix; whichever
+            # doesn't exist just errors harmlessly under the redirect.
+            [[ -n $cname ]] && $DOCKER rm -f "${cname}-db" "${cname}-rm" "${cname}-mask" >/dev/null 2>&1
             unclaim "$sample"
         fi
     done
 }
 
 #================================================================== processing
-# The actual work for one genome: decompress, BuildDatabase, RepeatModeler,
-# collect output.
+# Both stages need the genome as plain FASTA, so decompression happens once
+# per attempt regardless of which stages are due.
 #
-#   $1 = sample name   $2 = path to the .fna.gz   $3 = log file   $4 = job dir
+# It happens on the HOST, which is why $IN_DIR never has to be mounted into a
+# container: the container only ever sees one genome's scratch directory.
 #
-# Returns 0 on success, 130 if a shutdown interrupted it, 1 on any real error.
-# 130 is this script's private "aborted, not failed" code -- process_one()
-# treats it completely differently from a failure.
-run_pipeline() {
-    local sample=$1 gz=$2 logf=$3 jobdir=$4
-    local cname; cname=$(safe_name "$sample")
-    local ltr=() rc=0
-    (( LTRSTRUCT )) && ltr=(-LTRStruct)
-
-    # Decompression happens on the host, which means $IN_DIR never has to be
-    # mounted into the container. The container only ever sees one genome's
-    # scratch directory.
+#   $1 = sample   $2 = path to the .fna.gz   $3 = job dir
+decompress_genome() {
+    local sample=$1 gz=$2 jobdir=$3
     log "[$sample] decompressing"
     if ! zcat "$gz" > "$jobdir/$sample.fa"; then
         log "[$sample] decompression failed"; return 1
@@ -510,11 +528,22 @@ run_pipeline() {
     if [[ ! -s $jobdir/$sample.fa ]]; then
         log "[$sample] empty FASTA after decompression"; return 1
     fi
+    return 0
+}
 
-    # Decompression of a large genome is not instant either, so a stop
-    # request can already be pending by the time it finishes. Check before
-    # committing to BuildDatabase rather than only between the two stages
-    # below.
+# Stage one: BuildDatabase + RepeatModeler. Produces the repeat library.
+#
+#   $1 = sample   $2 = log file   $3 = job dir
+#
+# Returns 0 on success, 130 if a shutdown interrupted it, 1 on any real error.
+# 130 is this script's private "aborted, not failed" code -- process_one()
+# treats it completely differently from a failure.
+stage_model() {
+    local sample=$1 logf=$2 jobdir=$3
+    local cname; cname=$(safe_name "$sample")
+    local ltr=() rc=0
+    (( LTRSTRUCT )) && ltr=(-LTRStruct)
+
     (( SHUTDOWN )) && return 130
 
     # No -engine: current RepeatModeler (checked against 2.0.9) dropped
@@ -561,43 +590,171 @@ run_pipeline() {
     return 0
 }
 
-# Bookkeeping around run_pipeline: fresh job directory, fresh log, then record
-# the outcome as a state marker.
+# Stage two: RepeatMasker, using the library stage one built as a custom -lib.
+# This is the step that turns "which repeat families exist in this species"
+# into "where every copy of them actually sits", which is what everything
+# downstream of this repository consumes.
 #
-#   $1 = path to the .fna.gz   $2 = sample name
+#   $1 = sample   $2 = log file   $3 = job dir
 #
-# The three outcomes are handled differently on purpose:
+# Same return convention as stage_model: 0 / 130 / 1.
+stage_mask() {
+    local sample=$1 logf=$2 jobdir=$3
+    local cname; cname=$(safe_name "$sample")
+    local lib="$jobdir/$sample-families.fa" rc=0
+
+    (( SHUTDOWN )) && return 130
+
+    # The library is already sitting here when stage_model has just run. When
+    # we are masking a genome modelled on an EARLIER pass it is not, because
+    # the job directory was deleted on success -- so fetch it back from
+    # $OUT_DIR, the only place it survives.
+    if [[ ! -s $lib ]]; then
+        if [[ -s $OUT_DIR/$sample-families.fa ]]; then
+            log "[$sample] reusing library from $OUT_DIR"
+            cp -f "$OUT_DIR/$sample-families.fa" "$lib" || return 1
+        else
+            log "[$sample] cannot mask: no library at $OUT_DIR/$sample-families.fa"
+            log "[$sample] remove state/done/$sample to rebuild it from scratch"
+            return 1
+        fi
+    fi
+
+    # -lib makes this a CUSTOM library run: the repeats annotated are the ones
+    # RepeatModeler found in this genome, not Dfam's stock set for the clade.
+    #
+    # -pa is RepeatMasker's own parallelism (it forks that many search jobs);
+    # there is no -threads spelling to detect here, unlike RepeatModeler. The
+    # container's --cpus ceiling still applies on top of it.
+    #
+    # -xsmall soft-masks -- repeats come back lowercased instead of replaced
+    # with N -- so $sample.fa.masked stays usable as sequence for downstream
+    # motif scanning. It has no effect on the .out table.
+    log "[$sample] RepeatMasker (-pa $THREADS)"
+    docker_run "${cname}-mask" "$logf" "$jobdir" \
+        RepeatMasker -lib "$sample-families.fa" -pa "$THREADS" -xsmall "$sample.fa" \
+        || { rc=$?
+             (( SHUTDOWN )) && return 130
+             log "[$sample] RepeatMasker failed (rc $rc)"; return 1; }
+
+    # RepeatMasker writes the .out table even for a genome with no hits at
+    # all, so a missing or empty one means the run did not really finish.
+    if [[ ! -s $jobdir/$sample.fa.out ]]; then
+        log "[$sample] no .out table produced"; return 1
+    fi
+
+    # Renamed on the way out: RepeatMasker names its outputs after the input
+    # file ($sample.fa.out), which buries the role behind an extension that
+    # says nothing. <sample>.rm.out matches the <sample>-families.fa
+    # convention stage one uses.
+    cp -f "$jobdir/$sample.fa.out" "$OUT_DIR/$sample.rm.out" || return 1
+    [[ -s $jobdir/$sample.fa.tbl ]] && cp -f "$jobdir/$sample.fa.tbl" "$OUT_DIR/$sample.rm.tbl"
+
+    # The masked genome is as big as the genome, so it is only collected when
+    # asked for. Everything else RepeatMasker leaves behind (.cat.gz, .ori.out)
+    # stays in the job directory and goes with it.
+    if (( KEEP_MASKED_FASTA )) && [[ -s $jobdir/$sample.fa.masked ]]; then
+        cp -f "$jobdir/$sample.fa.masked" "$OUT_DIR/$sample.rm.masked.fa" || return 1
+    fi
+    return 0
+}
+
+# Shared tail for a stage that did not succeed. Abort and failure are treated
+# completely differently:
 #
-#   success  -> done/ marker written, scratch deleted (unless KEEP_WORK)
-#   abort    -> NO marker written, scratch deleted. The genome looks untouched
-#               and any future run picks it up
-#   failure  -> failed/ marker written, scratch and log KEPT so you can see
-#               what happened
-process_one() {
-    local gz=$1 sample=$2
-    local jobdir="$WORK_DIR/$sample"
-    local logf="$LOG_DIR/$sample.log"
-    local rc=0 t0=$SECONDS
-
-    # Wipe first: a retry must not inherit a half-finished RM_* directory from
-    # a previous attempt, which RepeatModeler would trip over.
-    rm -rf "$jobdir" && mkdir -p "$jobdir" || return 1
-    : > "$logf"
-
-    run_pipeline "$sample" "$gz" "$logf" "$jobdir"; rc=$?
-
-    if (( rc == 0 )); then
-        log "[$sample] done in $(( (SECONDS - t0) / 60 )) min"
-        date '+%F %T' > "$STATE_DIR/done/$sample"
-        (( KEEP_WORK )) || rm -rf "$jobdir"
-    elif (( rc == 130 )); then
+#   abort (130) -> NO marker written, scratch deleted. The stage looks
+#                  untouched and any future run picks it up again
+#   failure     -> failed/ marker written, scratch and log KEPT so you can see
+#                  what happened
+#
+#   $1 = sample   $2 = job dir   $3 = stage return code   $4 = log file
+finish_failed_stage() {
+    local sample=$1 jobdir=$2 rc=$3 logf=$4
+    if (( rc == 130 )); then
         log "[$sample] aborted by shutdown, leaving unclaimed for a retry"
         rm -rf "$jobdir"
     else
         log "[$sample] FAILED - work kept at $jobdir, log at $logf"
         date '+%F %T' > "$STATE_DIR/failed/$sample"
     fi
-    return "$rc"
+}
+
+# Bookkeeping around the stages: fresh job directory, fresh log, then record
+# each outcome as a state marker.
+#
+#   $1 = path to the .fna.gz   $2 = sample name
+#
+# Which stages run is decided here, from the markers that already exist:
+#
+#   no done/<sample>                      -> model
+#   RUN_MASKER=1 and no masked/<sample>   -> mask
+#
+# Each stage's marker is written the instant that stage succeeds, not at the
+# end. That is deliberate: a genome that models in 20 hours and then fails to
+# mask keeps done/ and its library, so the retry costs one RepeatMasker run
+# rather than another 20 hours.
+#
+# The two stages write to separate log files for the same reason -- a mask-only
+# retry must not truncate the RepeatModeler log of the run that produced the
+# library it is using.
+process_one() {
+    local gz=$1 sample=$2
+    local jobdir="$WORK_DIR/$sample"
+    local logf="$LOG_DIR/$sample.log"
+    local maskf="$LOG_DIR/$sample.masker.log"
+    local rc=0 t0=$SECONDS t1
+    local do_model=0 do_mask=0
+
+    [[ -e $STATE_DIR/done/$sample ]] || do_model=1
+    (( RUN_MASKER )) && [[ ! -e $STATE_DIR/masked/$sample ]] && do_mask=1
+
+    # Nothing left to do. Reachable when the markers changed between the main
+    # loop's check and winning the claim.
+    (( do_model || do_mask )) || return 0
+
+    # Wipe first: a retry must not inherit a half-finished RM_* directory from
+    # a previous attempt, which RepeatModeler would trip over.
+    rm -rf "$jobdir" && mkdir -p "$jobdir" || return 1
+
+    if ! decompress_genome "$sample" "$gz" "$jobdir"; then
+        finish_failed_stage "$sample" "$jobdir" 1 "$logf"
+        return 1
+    fi
+
+    # Decompression of a large genome is not instant, so a stop request can
+    # already be pending by the time it finishes. Check before committing to a
+    # container rather than only between stages.
+    if (( SHUTDOWN )); then
+        finish_failed_stage "$sample" "$jobdir" 130 "$logf"
+        return 130
+    fi
+
+    if (( do_model )); then
+        : > "$logf"
+        stage_model "$sample" "$logf" "$jobdir"; rc=$?
+        if (( rc != 0 )); then
+            finish_failed_stage "$sample" "$jobdir" "$rc" "$logf"
+            return "$rc"
+        fi
+        log "[$sample] modelled in $(( (SECONDS - t0) / 60 )) min"
+        date '+%F %T' > "$STATE_DIR/done/$sample"
+    fi
+
+    if (( do_mask )); then
+        t1=$SECONDS
+        : > "$maskf"
+        stage_mask "$sample" "$maskf" "$jobdir"; rc=$?
+        if (( rc != 0 )); then
+            finish_failed_stage "$sample" "$jobdir" "$rc" "$maskf"
+            return "$rc"
+        fi
+        log "[$sample] masked in $(( (SECONDS - t1) / 60 )) min"
+        date '+%F %T' > "$STATE_DIR/masked/$sample"
+    fi
+
+    log "[$sample] done in $(( (SECONDS - t0) / 60 )) min"
+    (( KEEP_WORK )) || rm -rf "$jobdir"
+    return 0
 }
 
 #======================================================================== main
@@ -616,7 +773,7 @@ fi
 detect_thread_flag
 reap_stale_claims
 
-log "starting: config=$CONFIG_FILE IN_DIR=$IN_DIR IMAGE=$RM_IMAGE THREADS=$THREADS LTRSTRUCT=$LTRSTRUCT"
+log "starting: config=$CONFIG_FILE IN_DIR=$IN_DIR IMAGE=$RM_IMAGE THREADS=$THREADS LTRSTRUCT=$LTRSTRUCT RUN_MASKER=$RUN_MASKER"
 
 processed=0
 
@@ -644,7 +801,15 @@ while IFS= read -r gz; do
 
     # Cheap skips. These are allowed to be stale -- the mkdir in claim() is
     # the authoritative step.
-    [[ -e $STATE_DIR/done/$sample ]] && continue
+    #
+    # A modelled genome is not necessarily finished: with RUN_MASKER=1 it is
+    # still available for the mask stage until masked/ exists too. This is
+    # what lets you turn masking on later and have the existing done/ genomes
+    # picked up again without re-running RepeatModeler.
+    if [[ -e $STATE_DIR/done/$sample ]]; then
+        (( RUN_MASKER )) || continue
+        [[ -e $STATE_DIR/masked/$sample ]] && continue
+    fi
     if [[ -e $STATE_DIR/failed/$sample ]]; then
         (( RETRY_FAILED )) || continue
         rm -f "$STATE_DIR/failed/$sample"

@@ -46,6 +46,18 @@ GLOB=*.fna.gz                 # which files in IN_DIR count as input
 LTRSTRUCT=0                   # 1 = add -LTRStruct; roughly doubles wall time
                               # and disk. Only if you want the LTR pipeline
 
+#--- RepeatMasker -------------------------------------------------------------
+RUN_MASKER=1                  # 1 = after RepeatModeler, run RepeatMasker on the
+                              # same genome using the library it just built.
+                              # Produces <sample>.rm.out in OUT_DIR, which is
+                              # what the downstream analysis consumes.
+                              # Turning this on later is safe: genomes already
+                              # marked done are picked up again for the mask
+                              # stage alone, and are NOT re-modelled.
+KEEP_MASKED_FASTA=0           # 1 = also copy the soft-masked genome
+                              # (<sample>.rm.masked.fa) to OUT_DIR. It is as
+                              # big as the genome, so off by default
+
 #--- behaviour ----------------------------------------------------------------
 KEEP_WORK=0                   # 1 = keep the RM_* rounds dirs on success
 RETRY_FAILED=0                # 1 = re-attempt samples marked failed
